@@ -9,6 +9,8 @@ const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 
 const byId = Object.fromEntries(CONTRATOS.map(c => [c.id, c]));
 const isTouch = matchMedia('(pointer:coarse)').matches;
 const ANDROID = /Android/i.test(navigator.userAgent);
+const INSTALADO = matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+const IOS = /iPhone|iPad|iPod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 const LINKS = {
   cc: 'https://www.planalto.gov.br/ccivil_03/leis/2002/l10406compilada.htm',
   cpc: 'https://www.planalto.gov.br/ccivil_03/_ato2015-2018/2015/lei/l13105.htm',
@@ -63,54 +65,90 @@ function citados(texto) {
 const citaContrato = (texto, c) => citados(texto).some(([id]) => id === c.id);
 
 /* ---------- Gravação ---------- */
-const rec = { mr: null, stream: null, chunks: [], marcas: [], acum: 0, desde: 0, wake: null, ctx: null, raf: 0, parando: false, id: null, titulo: '' };
+// Grava direto em WAV 16 kHz mono. É o formato que qualquer navegador e qualquer programa de
+// transcrição leem sem conversão (o MP4 do Safari às vezes não é lido de volta pelo próprio Safari).
+const TAXA = 16000;
+const rec = { mr: null, stream: null, chunks: [], marcas: [], acum: 0, desde: 0, wake: null, ctx: null, raf: 0, parando: false, id: null, titulo: '', nivel: 0, buf: [], pos: 0 };
 const decorrido = () => rec.acum + (rec.mr?.state === 'recording' ? (Date.now() - rec.desde) / 1000 : 0);
+const WORKLET = `class Cap extends AudioWorkletProcessor{constructor(){super();this.b=[];this.n=0}process(i){const c=i[0]&&i[0][0];if(c){this.b.push(c.slice());this.n+=c.length;if(this.n>=4096){const o=new Float32Array(this.n);let k=0;for(const x of this.b){o.set(x,k);k+=x.length}this.port.postMessage(o,[o.buffer]);this.b=[];this.n=0}}return true}}registerProcessor('cap',Cap)`;
+
+function cabecalhoWav(bytes) {
+  const v = new DataView(new ArrayBuffer(44)), str = (o, t) => [...t].forEach((c, k) => v.setUint8(o + k, c.charCodeAt(0)));
+  str(0, 'RIFF'); v.setUint32(4, 36 + bytes, true); str(8, 'WAVE'); str(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+  v.setUint16(22, 1, true); v.setUint32(24, TAXA, true); v.setUint32(28, TAXA * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  str(36, 'data'); v.setUint32(40, bytes, true); return v.buffer;
+}
+const montarWav = partes => { const bytes = partes.reduce((n, b) => n + b.size, 0); return new Blob([cabecalhoWav(bytes), ...partes], { type: 'audio/wav' }); };
+
+// Reduz a taxa do microfone (44,1 ou 48 kHz) para 16 kHz, com média por janela.
+function receber(amostras) {
+  if (rec.mr?.state !== 'recording') return;
+  const razao = rec.ctx.sampleRate / TAXA; let s = 0;
+  for (const v of amostras) s += v * v;
+  rec.nivel = Math.min(1, Math.sqrt(s / amostras.length) * 4);
+  const saida = [];
+  let p = rec.pos;
+  while (p + razao <= amostras.length) {
+    let soma = 0, n = 0; for (let k = Math.floor(p); k < Math.floor(p + razao); k++) { soma += amostras[k]; n++; }
+    saida.push(n ? soma / n : 0); p += razao;
+  }
+  rec.pos = p - amostras.length; // fração que passa para o próximo bloco
+  const i16 = new Int16Array(saida.length);
+  for (let k = 0; k < saida.length; k++) i16[k] = Math.max(-1, Math.min(1, saida[k])) * 0x7fff;
+  rec.buf.push(i16);
+  if (rec.buf.reduce((n, b) => n + b.length, 0) >= TAXA * 10) descarregar();
+}
+function descarregar() { if (!rec.buf.length) return; rec.chunks.push(new Blob(rec.buf)); rec.buf = []; salvarRascunho(); }
 
 async function iniciarGravacao() {
   if (rec.mr) return;
-  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) { toast('Este navegador não grava áudio. Use o Safari ou o Chrome atualizados.'); return; }
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!navigator.mediaDevices?.getUserMedia || !AC) { toast('Este navegador não grava áudio. Use o Safari ou o Chrome atualizados.'); return; }
   if (job) { toast('Aguarde a transcrição em andamento terminar antes de gravar.'); return; }
-  try { rec.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: true, autoGainControl: true } }); }
+  try { rec.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: true, autoGainControl: true, channelCount: 1 } }); }
   catch { toast('Sem acesso ao microfone. Libere o microfone para este site nos ajustes do navegador.'); return; }
-  const tipo = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm'].find(t => MediaRecorder.isTypeSupported?.(t));
-  rec.mr = new MediaRecorder(rec.stream, tipo ? { mimeType: tipo, audioBitsPerSecond: 64000 } : undefined);
-  Object.assign(rec, { chunks: [], marcas: [], acum: 0, desde: Date.now(), parando: false, id: uid(), titulo: 'Aula de ' + dataBR(Date.now()) });
-  rec.mr.ondataavailable = e => { if (e.data.size) { rec.chunks.push(e.data); salvarRascunho(); } };
-  rec.mr.onstop = finalizarGravacao;
-  rec.mr.start(10000);
+  try {
+    rec.ctx = new AC(); await rec.ctx.resume();
+    const fonte = rec.ctx.createMediaStreamSource(rec.stream);
+    if (rec.ctx.audioWorklet) {
+      const url = URL.createObjectURL(new Blob([WORKLET], { type: 'text/javascript' }));
+      await rec.ctx.audioWorklet.addModule(url); URL.revokeObjectURL(url);
+      const no = new AudioWorkletNode(rec.ctx, 'cap'); no.port.onmessage = e => receber(e.data);
+      fonte.connect(no); rec.no = no;
+    } else { // navegadores antigos
+      const no = rec.ctx.createScriptProcessor(4096, 1, 1); no.onaudioprocess = e => receber(e.inputBuffer.getChannelData(0).slice());
+      fonte.connect(no); no.connect(rec.ctx.destination); rec.no = no;
+    }
+  } catch (e) { console.error(e); rec.stream.getTracks().forEach(t => t.stop()); rec.ctx?.close().catch(() => {}); toast('Não consegui iniciar a gravação neste navegador.'); return; }
+  // "mr" imita a interface do MediaRecorder para o resto do app (estado, pausa e fim).
+  rec.mr = { state: 'recording', mimeType: 'audio/wav' };
+  Object.assign(rec, { chunks: [], buf: [], pos: 0, marcas: [], acum: 0, desde: Date.now(), parando: false, id: uid(), titulo: 'Aula de ' + dataBR(Date.now()) });
+  rec.stream.getAudioTracks()[0].onended = () => { if (rec.mr && !rec.parando) finalizarGravacao(); }; // microfone desconectado ou bloqueado
   medidor();
   manterTelaLigada();
   desenharBarra();
 }
 function salvarRascunho() {
-  KV.set('rascunho', { id: rec.id, titulo: rec.titulo, criada: rec.desde, tipo: rec.mr?.mimeType || 'audio/mp4', chunks: rec.chunks.slice(), marcas: rec.marcas, duracao: decorrido() }).catch(() => {});
+  KV.set('rascunho', { id: rec.id, titulo: rec.titulo, criada: rec.desde, tipo: 'audio/wav', pcm: true, chunks: rec.chunks.slice(), marcas: rec.marcas, duracao: decorrido() }).catch(() => {});
 }
 function medidor() {
-  try {
-    const AC = window.AudioContext || window.webkitAudioContext;
-    rec.ctx = new AC(); const an = rec.ctx.createAnalyser(); an.fftSize = 512;
-    rec.ctx.createMediaStreamSource(rec.stream).connect(an);
-    const buf = new Float32Array(an.fftSize);
-    const loop = () => {
-      an.getFloatTimeDomainData(buf); let s = 0; for (const v of buf) s += v * v;
-      const lvl = Math.min(1, Math.sqrt(s / buf.length) * 4);
-      const i = $('#lvl'); if (i) i.style.width = (lvl * 100) + '%';
-      const t = $('#rtimer'); if (t) t.textContent = fmt(decorrido());
-      rec.raf = requestAnimationFrame(loop);
-    };
-    loop();
-  } catch { /* o medidor é opcional */ }
+  const loop = () => {
+    const i = $('#lvl'); if (i) i.style.width = (rec.nivel * 100) + '%';
+    const t = $('#rtimer'); if (t) t.textContent = fmt(decorrido());
+    rec.raf = requestAnimationFrame(loop);
+  };
+  loop();
 }
 async function manterTelaLigada() { try { rec.wake = await navigator.wakeLock?.request('screen'); } catch { rec.wake = null; } }
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible' || !rec.mr) return;
-  if (rec.mr.state === 'inactive' && !rec.parando) return; // onstop já cuidou
+  rec.ctx?.resume().catch(() => {});
   manterTelaLigada();
 });
 function pausarRetomar() {
   if (!rec.mr) return;
-  if (rec.mr.state === 'recording') { rec.acum = decorrido(); rec.mr.pause(); }
-  else if (rec.mr.state === 'paused') { rec.desde = Date.now(); rec.mr.resume(); }
+  if (rec.mr.state === 'recording') { rec.acum = decorrido(); rec.mr.state = 'paused'; descarregar(); }
+  else if (rec.mr.state === 'paused') { rec.desde = Date.now(); rec.mr.state = 'recording'; rec.ctx?.resume().catch(() => {}); }
   desenharBarra();
 }
 function marcar() {
@@ -118,21 +156,27 @@ function marcar() {
   rec.marcas.push({ t: decorrido(), texto }); if (inp) inp.value = '';
   toast(`Marcado em ${fmt(decorrido())}: ${texto}`); salvarRascunho();
 }
-function pararGravacao() { if (!rec.mr) return; rec.parando = true; rec.acum = decorrido(); if (rec.mr.state !== 'inactive') rec.mr.stop(); else finalizarGravacao(); }
+function pararGravacao() { if (!rec.mr) return; rec.parando = true; finalizarGravacao(); }
 async function finalizarGravacao() {
-  const mr = rec.mr; if (!mr) return;
+  if (!rec.mr) return;
   const inesperado = !rec.parando;
-  if (inesperado) rec.acum = decorrido();
-  cancelAnimationFrame(rec.raf); rec.ctx?.close().catch(() => {});
+  rec.acum = decorrido(); rec.mr.state = 'inactive';
+  descarregar();
+  cancelAnimationFrame(rec.raf);
+  try { rec.no?.disconnect(); } catch { }
+  rec.ctx?.close().catch(() => {});
   rec.stream?.getTracks().forEach(t => t.stop());
   rec.wake?.release?.().catch(() => {});
-  const blob = new Blob(rec.chunks, { type: mr.mimeType || 'audio/mp4' });
+  const blob = montarWav(rec.chunks);
   const aula = { id: rec.id, titulo: rec.titulo, criada: rec.desde, origem: 'gravada', tipo: blob.type, blob, duracao: rec.acum, marcas: rec.marcas, segs: [], notas: '' };
   rec.mr = null; desenharBarra();
-  if (!blob.size) { toast('A gravação ficou vazia e não foi salva.'); KV.del('rascunho'); return; }
+  if (blob.size <= 44) { toast('A gravação ficou vazia e não foi salva.'); KV.del('rascunho'); return; }
   try { await Aulas.put(aula); await KV.del('rascunho'); }
   catch { toast('Não consegui salvar a gravação. Verifique o espaço livre no aparelho.'); return; }
   toast(inesperado ? 'O sistema interrompeu a gravação. O trecho gravado foi salvo.' : 'Gravação salva.');
+  sessionStorage.setItem('recemGravada', aula.id);
+  // Sempre gera o arquivo da aula. No iPhone o sistema exige um toque, então o botão aparece na tela da aula.
+  if (!IOS && !INSTALADO) salvarArquivo(blob, aula.titulo + '.wav', true).then(() => toast('Arquivo da aula (WAV) salvo em Downloads. Ele pode ser transcrito em qualquer programa.')).catch(() => {});
   location.hash = '#aula/' + aula.id;
 }
 function desenharBarra() {
@@ -161,6 +205,12 @@ const MODELOS = [
 ];
 async function lerAudio(blob) {
   const buf = await blob.arrayBuffer();
+  const v = new DataView(buf);
+  if (buf.byteLength > 44 && v.getUint32(0) === 0x52494646 && v.getUint16(20, true) === 1 && v.getUint16(22, true) === 1 && v.getUint32(24, true) === 16000 && v.getUint16(34, true) === 16) {
+    const n = Math.floor((buf.byteLength - 44) / 2), out = new Float32Array(n);
+    for (let k = 0; k < n; k++) out[k] = v.getInt16(44 + k * 2, true) / 0x8000;
+    return out;
+  }
   const Off = window.OfflineAudioContext || window.webkitOfflineAudioContext;
   const ctx = new Off(1, 1, 16000);
   const ab = await new Promise((res, rej) => { const p = ctx.decodeAudioData(buf, res, rej); p?.then?.(res, rej); });
@@ -180,7 +230,7 @@ async function transcrever(id, modelo) {
   job = { id, status: 'Lendo o áudio…', segs: [] }; atualizarTranscricao();
   let audio;
   try { audio = await lerAudio(a.blob); }
-  catch { job = null; atualizarTranscricao(); toast('Não consegui ler o áudio deste arquivo. Tente um arquivo de áudio (m4a ou mp3).'); return; }
+  catch { job = null; atualizarTranscricao(); toast('Este navegador não conseguiu ler o áudio. Use “Reparar áudio”, logo abaixo do player.'); const r = $('#reparo'); if (r) { r.hidden = false; r.scrollIntoView({ behavior: 'smooth', block: 'center' }); } return; }
   await alterarAula(id, x => { x.segs = []; x.transcricao = 'andamento'; x.modelo = modelo; });
   const w = new Worker('worker.js', { type: 'module' });
   w.onmessage = ({ data }) => {
@@ -206,6 +256,32 @@ async function atualizarTranscricao(full) {
   const st = $('#tstatus'); if (st) st.textContent = job?.id === a.id ? job.status : '';
   const btn = $('#transcrever'); if (btn) btn.disabled = !!job;
   desenharSegs(a); desenharCitados(a);
+}
+
+/* ---------- Reparo de áudio ilegível ---------- */
+let reparando = false;
+async function repararAula(id) {
+  if (reparando) return; reparando = true;
+  const st = t => { const e = $('#reparoSt'); if (e) e.textContent = t; };
+  const btn = $('#reparar'); if (btn) btn.disabled = true;
+  const a = await Aulas.get(id);
+  let bytes;
+  try { bytes = await a.blob.arrayBuffer(); } catch { reparando = false; st(''); toast('Não consegui abrir os dados desta gravação.'); return; }
+  const w = new Worker('reparo.js');
+  const fim = () => { reparando = false; w.terminate(); if (btn) btn.disabled = false; };
+  w.onmessage = async ({ data }) => {
+    if (data.type === 'status') st(data.text);
+    if (data.type === 'error') { fim(); st(''); toast('Não consegui reparar: ' + data.text); }
+    if (data.type === 'done') {
+      fim();
+      const wavBlob = new Blob([data.wav], { type: 'audio/wav' });
+      await alterarAula(id, x => { if (!x.original) { x.original = x.blob; x.tipoOriginal = x.tipo; } x.blob = wavBlob; x.tipo = 'audio/wav'; x.duracao = (data.wav.byteLength - 44) / 32000; });
+      toast('Áudio reparado. Agora ele toca e pode ser transcrito.');
+      if (aulaAberta === id) route();
+    }
+  };
+  w.onerror = () => { fim(); st(''); toast('O conversor não carregou. Confira a internet e tente de novo.'); };
+  w.postMessage({ bytes }, [bytes]);
 }
 
 /* ---------- Roteamento ---------- */
@@ -242,7 +318,7 @@ async function viewAulas() {
   $('#arquivo').onchange = e => enviarArquivos([...e.target.files]);
   if ($('#recuperar')) $('#recuperar').onclick = async () => {
     const r = await KV.get('rascunho');
-    const blob = new Blob(r.chunks, { type: r.tipo });
+    const blob = r.pcm ? montarWav(r.chunks) : new Blob(r.chunks, { type: r.tipo });
     await Aulas.put({ id: r.id, titulo: r.titulo, criada: r.criada, origem: 'gravada', tipo: blob.type, blob, duracao: r.duracao, marcas: r.marcas || [], segs: [], notas: '' });
     await KV.del('rascunho'); toast('Gravação recuperada.'); location.hash = '#aula/' + r.id;
   };
@@ -278,10 +354,16 @@ async function viewAula(id, t) {
   <p class="muted">${dataBR(a.criada)} · ${a.origem === 'gravada' ? 'Gravada no app' : 'Arquivo enviado'}</p>
   <div class="card">
     ${video ? `<video id="player" src="${url}" controls playsinline preload="metadata"></video>` : `<audio id="player" src="${url}" controls preload="metadata"></audio>`}
+    <div id="reparo" class="card warn" style="margin:10px 0 0" hidden><b>Este áudio não abre neste navegador.</b>
+      <p class="muted" style="margin:6px 0 10px">Foram gravados ${(a.blob.size / 1048576).toLocaleString('pt-BR', { maximumFractionDigits: 1 })} MB. O app pode converter a gravação para WAV aqui mesmo, sem enviar para a internet. Depois ela toca e pode ser transcrita normalmente.</p>
+      <div class="row"><button id="reparar" class="primary">Reparar áudio</button><span class="muted" id="reparoSt"></span></div></div>
     <div class="row" style="margin-top:8px"><span class="muted">Velocidade</span>${[1, 1.25, 1.5, 1.75, 2].map(v => `<button class="mini vel" data-v="${v}">${String(v).replace('.', ',')}×</button>`).join('')}
     <button class="mini" id="voltar10">−10 s</button></div>
     ${a.marcas?.length ? `<h3 style="margin-top:14px">Momentos marcados</h3>${a.marcas.map(m => `<div class="line"><button class="time" data-t="${m.t}">${fmt(m.t)}</button><span>${esc(m.texto)}</span></div>`).join('')}` : ''}
   </div>
+  ${sessionStorage.getItem('recemGravada') === id ? `<div class="card warn" id="arqTranscr"><b>Arquivo da aula para transcrição</b>
+    <p class="muted" style="margin:6px 0 10px">${IOS || INSTALADO ? 'Toque para salvar o arquivo (no app instalado, abre a janela de compartilhar: salve em Arquivos, OneDrive ou envie por AirDrop).' : 'O áudio já foi salvo em Downloads em WAV.'} A versão WAV funciona em qualquer programa de transcrição.</p>
+    <div class="row"><button class="primary" data-salvar="orig">Salvar áudio da aula</button><button data-salvar="wav">Salvar em WAV</button><button data-salvar="ok">Pronto</button></div></div>` : ''}
   <div class="card"><h3>Contratos tratados nesta aula</h3><div id="citados" class="row"></div></div>
   <div class="card">
     <div class="row"><h3 class="grow" style="margin:0">Transcrição</h3>
@@ -297,11 +379,14 @@ async function viewAula(id, t) {
   </div>
   <div class="card"><h3>Minhas anotações</h3><textarea id="notas" placeholder="Resumo, dúvidas, o que o professor disse que cai na prova…">${esc(a.notas)}</textarea>
     <p class="muted" id="notasSt"></p></div>
-  <div class="card row"><button id="baixarTxt">Exportar transcrição (.txt)</button><button id="baixarAudio">Exportar áudio</button>
+  <div class="card row"><button id="baixarAudio">Exportar áudio</button><button id="baixarWav">Áudio em WAV (para transcrição)</button><button id="baixarTxt">Transcrição (.txt)</button><button id="baixarSrt">Legenda (.srt)</button>
     <span class="grow"></span><button id="apagar" class="danger">Apagar aula</button></div>
   <div id="confirmar"></div>`;
 
   const player = $('#player');
+  const mostrarReparo = () => { if (a.blob.size > 2000) $('#reparo').hidden = false; else toast('A gravação desta aula ficou vazia.'); };
+  player.onerror = mostrarReparo;
+  $('#reparar').onclick = () => repararAula(id);
   const ir = s => { player.currentTime = +s; player.play().catch(() => {}); };
   view.querySelectorAll('.vel').forEach(b => b.onclick = () => { player.playbackRate = +b.dataset.v; });
   $('#voltar10').onclick = () => { player.currentTime = Math.max(0, player.currentTime - 10); };
@@ -325,6 +410,13 @@ async function viewAula(id, t) {
   let tm; $('#notas').oninput = e => { $('#notasSt').textContent = 'Salvando…'; clearTimeout(tm); tm = setTimeout(() => alterarAula(id, x => { x.notas = e.target.value; }).then(() => { $('#notasSt').textContent = 'Salvo'; desenharCitados(null); }), 600); };
   $('#baixarTxt').onclick = async () => { const x = await Aulas.get(id); salvarArquivo(new Blob([(x.segs || []).map(s => (s.t != null ? `[${fmt(s.t)}] ` : '') + s.text).join('\n') + (x.notas ? '\n\nANOTAÇÕES\n' + x.notas : '')], { type: 'text/plain' }), x.titulo + '.txt'); };
   $('#baixarAudio').onclick = () => salvarArquivo(a.blob, a.titulo + extensao(a.tipo));
+  $('#baixarWav').onclick = () => salvarWav(a);
+  $('#baixarSrt').onclick = async () => { const x = await Aulas.get(id); if (!x.segs?.some(s => s.t != null)) { toast('A legenda precisa de uma transcrição com tempos.'); return; } salvarArquivo(new Blob([srt(x.segs)], { type: 'application/x-subrip' }), x.titulo + '.srt'); };
+  view.querySelectorAll('[data-salvar]').forEach(b => b.onclick = () => {
+    if (b.dataset.salvar === 'orig') salvarArquivo(a.blob, a.titulo + extensao(a.tipo));
+    if (b.dataset.salvar === 'wav') salvarWav(a);
+    if (b.dataset.salvar === 'ok') { sessionStorage.removeItem('recemGravada'); $('#arqTranscr')?.remove(); }
+  });
   $('#apagar').onclick = () => {
     $('#confirmar').innerHTML = `<div class="card warn"><b>Apagar “${esc(a.titulo)}”?</b> O áudio, a transcrição e as anotações saem deste aparelho e não podem ser recuperados, a menos que você tenha um backup.
       <div class="row" style="margin-top:8px"><button id="simApagar" class="primary">Apagar de vez</button><button id="naoApagar">Cancelar</button></div></div>`;
@@ -402,10 +494,30 @@ async function desenharCitados() {
 }
 const extensao = t => t?.includes('mp4') ? (t.startsWith('video') ? '.mp4' : '.m4a') : t?.includes('webm') ? '.webm' : t?.includes('mpeg') ? '.mp3' : t?.includes('wav') ? '.wav' : '';
 
-async function salvarArquivo(blob, nome) {
+// WAV 16 kHz mono: formato aceito por qualquer serviço de transcrição.
+function wav(amostras, taxa = 16000) {
+  const buf = new ArrayBuffer(44 + amostras.length * 2), v = new DataView(buf);
+  const str = (o, t) => [...t].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+  str(0, 'RIFF'); v.setUint32(4, 36 + amostras.length * 2, true); str(8, 'WAVE'); str(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, taxa, true);
+  v.setUint32(28, taxa * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true); str(36, 'data'); v.setUint32(40, amostras.length * 2, true);
+  for (let i = 0; i < amostras.length; i++) v.setInt16(44 + i * 2, Math.max(-1, Math.min(1, amostras[i])) * 0x7fff, true);
+  return new Blob([buf], { type: 'audio/wav' });
+}
+async function salvarWav(a) {
+  toast('Convertendo para WAV…');
+  try { await salvarArquivo(wav(await lerAudio(a.blob)), a.titulo + '.wav'); }
+  catch { toast('Não consegui converter este áudio. Use “Exportar áudio”.'); }
+}
+function srt(segs) {
+  const ts = s => { const ms = Math.round(s * 1000), h = Math.floor(ms / 36e5), m = Math.floor(ms % 36e5 / 6e4), x = Math.floor(ms % 6e4 / 1000); return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(x).padStart(2, '0')},${String(ms % 1000).padStart(3, '0')}`; };
+  const c = segs.filter(s => s.t != null);
+  return c.map((s, i) => `${i + 1}\n${ts(s.t)} --> ${ts(Math.max(s.t + 1, c[i + 1]?.t ?? s.t + 5))}\n${s.text}\n`).join('\n');
+}
+async function salvarArquivo(blob, nome, semCompartilhar) {
   nome = nome.replace(/[\\/:*?"<>|]/g, '-');
   const f = new File([blob], nome, { type: blob.type || 'application/octet-stream' });
-  if (isTouch && navigator.canShare?.({ files: [f] })) { try { await navigator.share({ files: [f] }); return; } catch (e) { if (e.name === 'AbortError') return; } }
+  if (!semCompartilhar && (isTouch || INSTALADO) && navigator.canShare?.({ files: [f] })) { try { await navigator.share({ files: [f] }); return; } catch (e) { if (e.name === 'AbortError') return; } }
   const a = document.createElement('a'); a.href = URL.createObjectURL(f); a.download = nome; document.body.append(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 10000);
 }
@@ -550,7 +662,6 @@ async function viewCartoes() {
     if (!ok) fila.push(atual);
     await KV.set('srs', srs); proximo();
   };
-  view.onkeydown = null;
   document.onkeydown = e => {
     if (!location.hash.startsWith('#cartoes') || /INPUT|TEXTAREA|SELECT/.test(e.target.tagName) || !atual) return;
     if (e.key === ' ' && !mostrado) { e.preventDefault(); mostrar(); }

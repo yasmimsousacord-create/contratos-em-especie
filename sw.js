@@ -1,6 +1,6 @@
 // Funciona sem internet depois da primeira visita. Busca a versão nova quando há rede.
-const CACHE='contratos-v3';
-const SHELL=['./','index.html','styles.css','app.js','data.js','worker.js','manifest.webmanifest','icon-512.png'];
+const CACHE='contratos-v5';
+const SHELL=['./','index.html','styles.css','app.js','data.js','worker.js','reparo.js','manifest.webmanifest','icon-512.png'];
 self.addEventListener('install',e=>{e.waitUntil(caches.open(CACHE).then(c=>c.addAll(SHELL)));self.skipWaiting();});
 self.addEventListener('activate',e=>{e.waitUntil(caches.keys().then(ks=>Promise.all(ks.filter(k=>k!==CACHE).map(k=>caches.delete(k)))));self.clients.claim();});
 self.addEventListener('fetch',e=>{
